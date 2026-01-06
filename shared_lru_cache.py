@@ -1,87 +1,126 @@
 import threading
+from dataclasses import dataclass
+from typing import Dict, Optional, List
 
 
+@dataclass
 class Node:
-    def __init__(self, key, val):
-        self.val = val
-        self.key = key
-        self.next = None
-        self.prev = None
+    key: int
+    val: int
+    prev: Optional["Node"] = None
+    next: Optional["Node"] = None
 
 
 class LRUCache:
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.mapping = {}
-        self.head = Node(0, 0)
-        self.tail = Node(0, 0)
-        self.tail.prev = self.head
-        self.head.next = self.tail
-        # for insert/remove
-        self.lock = threading.RLock() 
+    """
+    Thread-safe LRU cache (O(1) get/put) using:
+      - dict: key -> node
+      - doubly linked list: most-recent at tail, least-recent at head.next
+    """
 
-    def _insert(self, node):
-        # the caller should acquire locks before calling this func
-        prev = self.tail.prev
-        self.tail.prev = node
+    def __init__(self, capacity: int):
+        self.capacity = max(0, int(capacity))
+        self.mapping: Dict[int, Node] = {}
+
+        # sentinel nodes
+        self.head = Node(-1, -1)
+        self.tail = Node(-1, -1)
+        self.head.next = self.tail
+        self.tail.prev = self.head
+
+        self.lock = threading.RLock()
+
+    # ----- list helpers (caller must hold lock) -----
+
+    def _add_to_tail(self, node: Node) -> None:
+        """Insert node right before tail (most recent)."""
+        last = self.tail.prev
+        assert last is not None  # sentinel always has prev
+
+        last.next = node
+        node.prev = last
         node.next = self.tail
-        prev.next = node
-        node.prev = prev
-    
-    def _remove(self, node):
-        # the caller should acquire locks before calling this func
+        self.tail.prev = node
+
+    def _unlink(self, node: Node) -> None:
+        """Remove node from the list (node must be linked)."""
         prev = node.prev
-        next_ = node.next
-        prev.next = next_
-        next_.prev = prev
+        nxt = node.next
+        if prev is None or nxt is None:
+            # Defensive: shouldn't happen if used correctly
+            return
+        prev.next = nxt
+        nxt.prev = prev
+        node.prev = node.next = None  # optional: helps avoid accidental reuse bugs
+
+    def _touch(self, node: Node) -> None:
+        """Mark as most-recent."""
+        self._unlink(node)
+        self._add_to_tail(node)
+
+    def _evict_lru(self) -> None:
+        """Evict least-recently-used node if over capacity."""
+        if len(self.mapping) <= self.capacity:
+            return
+        lru = self.head.next
+        if lru is None or lru is self.tail:
+            return
+        self._unlink(lru)
+        self.mapping.pop(lru.key, None)
+
+    # ----- public API -----
 
     def get(self, key: int) -> int:
         with self.lock:
-            if key not in self.mapping:
+            node = self.mapping.get(key)
+            if node is None:
                 return -1
-
-            node = self.mapping[key]
-            self._remove(node)
-            self._insert(node)
+            self._touch(node)
             return node.val
 
     def put(self, key: int, value: int) -> None:
+        if self.capacity == 0:
+            return
+
         with self.lock:
-            if key in self.mapping:
-                self._remove(self.mapping[key])
-            
-            new_node = Node(key, value)
-            self.mapping[key] = new_node
-            self._insert(new_node)
+            node = self.mapping.get(key)
+            if node is not None:
+                # update + mark most-recent
+                node.val = value
+                self._touch(node)
+                return
 
-            if len(self.mapping) > self.capacity:
-                evict = self.head.next
-                self._remove(evict)
-                # prevent memory leak
-                if evict.key in self.mapping:
-                    del self.mapping[evict.key]
+            node = Node(key, value)
+            self.mapping[key] = node
+            self._add_to_tail(node)
+            self._evict_lru()
 
 
-# obj = LRUCache(capacity)
-# param_1 = obj.get(key)
-# obj.put(key,value)
+class ShardedLRUCache:
+    """
+    Sharded (approximate) LRU for better parallelism:
+      - LRU is per-shard, not global.
+      - Capacity is distributed across shards (with remainder spread).
+    """
 
+    def __init__(self, total_capacity: int, num_shards: int = 16):
+        self.num_shards = max(1, int(num_shards))
+        total_capacity = max(0, int(total_capacity))
 
-class ShardedLRUCache: # approximate LRU for better parallelism
-    def __init__(self, total_capacity, num_shards=16):
-        self.num_shards = num_shards
-        # allocate capacity for each shard
-        # TODO: implement LRU for more stable hashing result
-        shard_cap = total_capacity // num_shards
-        self.shards = [LRUCache(shard_cap) for _ in range(num_shards)]
+        base = total_capacity // self.num_shards
+        rem = total_capacity % self.num_shards
 
-    def _get_shard(self, key):
+        # spread the remainder so total capacity matches exactly
+        caps: List[int] = [base + (1 if i < rem else 0) for i in range(self.num_shards)]
+        self.shards = [LRUCache(c) for c in caps]
+
+    def _get_shard(self, key: int) -> LRUCache:
+        # For an in-memory toy cache, Python's hash() is fine.
+        # TODO: Use a stable hash for stable sharding across processes
         return self.shards[hash(key) % self.num_shards]
 
-    def get(self, key):
-        shard = self._get_shard(key)
-        return shard.get(key)
+    def get(self, key: int) -> int:
+        return self._get_shard(key).get(key)
 
-    def put(self, key, value):
-        shard = self._get_shard(key)
-        shard.put(key, value)
+    def put(self, key: int, value: int) -> None:
+        self._get_shard(key).put(key, value)
